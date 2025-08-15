@@ -61,16 +61,22 @@ def divisible_by(num, den):
 
 # random sinusoidal for times - used by deepmind a lot
 
-class RandomSinusoidalPosEmb(Module):
-    def __init__(self, dim):
+
+class RandomSinusoidalPosEmb(nn.Module):
+    def __init__(self, dim: int):
         super().__init__()
         assert divisible_by(dim, 2)
         half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad = False)
+        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=False)
 
-    def forward(self, x):
-        freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * torch.pi
-        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 1:
+            x = x[:, None]
+        elif x.ndim > 1 and x.shape[-1] != 1:
+            x = x[..., :1]
+        x = x.float()
+        freqs = x * self.weights[None, :] * 2 * torch.pi
+        fouriered = torch.cat((freqs.sin(), freqs.cos()), dim=-1)
         return fouriered
 
 # DiT wrapper
