@@ -363,8 +363,8 @@ class LBM(Module):
             noise = noise[..., :-1]
 
         if self.normalize_actions:
-            mean, std = self.action_mean_std_for_norm.unbind(dim = -1)
-            sampled = sampled * std + mean
+            mean, std = self.action_mean_std_for_norm.unbind(dim=-1)
+            sampled_actions = sampled_actions * std + mean
 
         if not return_noise:
             return sampled_actions
