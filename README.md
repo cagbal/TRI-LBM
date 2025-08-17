@@ -19,7 +19,7 @@ $ pip install git+https://github.com/cagbal/TRI-LBM
 
 ```python
 import torch
-from TRI_LBM.lbm import LBM
+from TRI_LBM import LBM
 
 lbm = LBM(
     action_dim = 20,
