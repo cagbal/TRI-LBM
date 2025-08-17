@@ -180,7 +180,8 @@ class LBM(Module):
         accept_additional_context = False,  # cross attend to additional context, will be used on CLIP text encoding to improve on language following
         additional_context_dim = None,
         cross_attend_text_encodings = False,
-        dropout_text_encodings_prob = 0.5
+        dropout_text_encodings_prob = 0.5,
+        image_size=256
     ):
         super().__init__()
         # Clip, they use
@@ -201,7 +202,7 @@ class LBM(Module):
         # assume one image for starters
 
         dim_text_feats = language_model.encode_text(tokenizer(['test'])).shape[-1]
-        dim_image_feats = image_model.encode_image(torch.randn(1, 3, 224, 224)).shape[-1]
+        dim_image_feats = image_model.encode_image(torch.randn(1, 3, image_size, image_size)).shape[-1]
 
         # store language and image model as video frame processor
 
@@ -248,7 +249,7 @@ class LBM(Module):
             dim_pose
         )
 
-        self.images_shape = (3, num_image_frames, 224, 224) # just enforce this shape to begin with
+        self.images_shape = (3, num_image_frames, image_size, image_size) # just enforce this shape to begin with
 
         self.diffusion_transformer = DiffusionTransformerWrapper(
             dim_input = action_dim + maybe_task_status_dim,
