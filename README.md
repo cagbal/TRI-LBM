@@ -12,7 +12,7 @@ Implementation of the Large Behavioral Model architecture for [dexterous manipul
 ## Install
 
 ```shell
-$ pip install git+https://github.com/cagbal/TRI-LBM/edit/main/README.md
+$ pip install git+https://github.com/cagbal/TRI-LBM
 ```
 
 ## Usage
