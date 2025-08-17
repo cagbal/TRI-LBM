@@ -1,6 +1,6 @@
 <img width="936" height="431" alt="Screenshot 2025-07-10 at 5 12 49 PM" src="https://github.com/user-attachments/assets/8bcd69d5-c02c-4f17-bb33-25c6363f1935" />
 
-## LBM - TRI (wip)
+## LBM - TRI (wip) - PLEASE DO NOT USE THIS REPO - IT IS INTENDED TO BE HIGHLY EXPERIMENTAL
 
 Implementation of the Large Behavioral Model architecture for [dexterous manipulation](https://arxiv.org/abs/2507.05331) from Toyota Research Institute. 
 
@@ -12,7 +12,7 @@ Implementation of the Large Behavioral Model architecture for [dexterous manipul
 ## Install
 
 ```shell
-$ pip install TRI-LBM
+$ pip install git+https://github.com/cagbal/TRI-LBM/edit/main/README.md
 ```
 
 ## Usage
