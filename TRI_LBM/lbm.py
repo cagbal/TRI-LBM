@@ -338,7 +338,10 @@ class LBM(Module):
 
         # image preprocess
 
-        images = self.image_preprocess(images)
+        b, c, t, h, w = images.shape
+        images = rearrange(images, 'b c t h w -> (b t) c h w') # Reshape for normalization
+        images = self.image_preprocess(images)                  # Apply normalization
+        images = rearrange(images, '(b t) c h w -> b c t h w', t=t) # Reshape back
 
         image_embeds = self.accept_video_wrapper(images, eval_with_no_grad = True)
 
