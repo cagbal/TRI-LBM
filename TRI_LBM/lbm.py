@@ -1,7 +1,9 @@
 from __future__ import annotations
+from functools import wraps
 
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from torch import nn, Tensor, tensor, is_tensor, cat, stack
 from torch.utils._pytree import tree_map
 from torch.nn import Module, ModuleList
@@ -12,16 +14,19 @@ from torch.nn import Module, ModuleList
 # c - channels
 # h - height
 # w - width
+# d - dimension
+# na - num actions
 
 import einx
-from einops import rearrange, repeat, pack, unpack
-from einops.layers.torch import Rearrange
+from einops import rearrange, repeat, pack, unpack, reduce
+from einops.layers.torch import Rearrange, Reduce
 
 # dogfooding
 
 from x_transformers import (
     Encoder,
-    TransformerWrapper
+    TransformerWrapper,
+    ContinuousTransformerWrapper
 )
 
 from denoising_diffusion_pytorch import (
@@ -67,6 +72,280 @@ def detach_all(obj):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def inputs_to_module_device(fn):
+    @wraps(fn)
+    def inner(self, *args, **kwargs):
+        assert hasattr(self, 'device')
+        device = self.device
+
+        args, kwargs = tree_map(lambda t: t.to(device) if is_tensor(t) else t, (args, kwargs))
+
+        return fn(self, *args, **kwargs)
+
+    return inner
+
+# dataset normalization related
+# Russ Tedrake's proposal
+
+class ActionClassifier(Module):
+    def __init__(
+        self,
+        *,
+        dim_action,
+        num_action_types,
+        dim = 256,
+        depth = 3,
+        attn_kwargs: dict = dict(
+            attn_dim_head = 64,
+            heads = 8
+        ),
+        action_counts: Tensor | None = None,
+        action_mean: Tensor | None = None,
+        action_variance: Tensor | None = None,
+        action_sum_diff_squared: Tensor | None = None,
+        eps = 1e-5
+    ):
+        super().__init__()
+
+        self.num_action_types = num_action_types
+
+        self.to_tokens = nn.Sequential(
+            nn.Linear(dim_action, dim)
+        )
+
+        self.transformer = Encoder(
+            dim = dim,
+            depth = depth,
+            **attn_kwargs
+        )
+
+        self.to_logits = nn.Sequential(
+            Reduce('b n d -> b d', 'mean'),
+            nn.Linear(dim, num_action_types)
+        )
+
+        # store norm related
+
+        assert not (exists(action_variance) and exists(action_sum_diff_squared))
+
+        if exists(action_variance):
+            assert exists(action_counts) and (action_counts > 1).all()
+            action_sum_diff_squared = einx.multiply('b d, b', action_variance, action_counts - 1.)
+
+        self.register_buffer('action_counts', default(action_counts, torch.zeros(num_action_types)))
+        self.register_buffer('action_mean', default(action_mean, torch.zeros(num_action_types, dim_action)))
+        self.register_buffer('action_sum_diff_squared', default(action_sum_diff_squared, torch.zeros(num_action_types, dim_action)))
+
+    @property
+    def device(self):
+        return self.action_counts.device
+
+    @property
+    def action_variance(self):
+        return einx.divide('b d, b', self.action_sum_diff_squared, self.action_counts - 1)
+
+    def get_stats_from_dataset_(
+        self,
+        dataset,
+        batch_size = 32,
+        parallel = True
+    ):
+        dataloader = DataLoader(dataset, batch_size = batch_size)
+
+        update_stats_fn = self.update_action_statistics_with_parallel_welford_ if parallel else self.update_action_statistics_with_welford_
+
+        for actions, action_types in dataloader:
+            update_stats_fn(actions, action_types)
+
+    def standardize_shapes(
+        self,
+        actions,
+        action_types
+    ):
+        if actions.ndim == 3:
+            times = actions.shape[1]
+            actions = rearrange(actions, 'b t d -> (b t) d')
+
+            # the entire time chunk is of one action type
+
+            if action_types.ndim == 1:
+                action_types = repeat(action_types, 'b -> (b t)', t = times)
+
+        if action_types.ndim == 2:
+            action_types = rearrange(action_types, 'b t -> (b t)')
+
+        assert actions.shape[0] == action_types.shape[0]
+
+        return actions, action_types
+
+    def update_action_statistics_with_welford_(
+        self,
+        actions,      # (b d) | (b t d)
+        action_types  # (b) | (b t)
+    ):
+        actions, action_types = self.standardize_shapes(actions, action_types)
+
+        for one_action, action_type in zip(actions, action_types):
+
+            count = self.action_counts[action_type]
+            mean = self.action_mean[action_type]
+            sum_diff_squared = self.action_sum_diff_squared[action_type]
+
+            count += 1
+            delta = one_action - mean
+            new_mean = mean + delta / count
+            sum_diff_squared += delta * (one_action - new_mean)
+
+            self.action_counts[action_type] = count
+            self.action_mean[action_type] = new_mean
+            self.action_sum_diff_squared[action_type] = sum_diff_squared
+
+    def update_action_statistics_with_parallel_welford_(
+        self,
+        actions,      # (b d) | (b t d)
+        action_types  # (b) | (b t)
+    ):
+        actions, action_types = self.standardize_shapes(actions, action_types)
+
+        batch, device = actions.shape[0], actions.device
+
+        num_actions_seq = torch.arange(self.num_action_types, device = device)
+
+        mask = einx.equal('na, b -> na b', num_actions_seq, action_types)
+
+        old_sum_diff_squared, old_mean, old_count = self.action_sum_diff_squared, self.action_mean, self.action_counts
+
+        count = reduce(mask, 'na b -> na', 'sum')
+
+        next_count = old_count + count
+
+        repeated_actions = repeat(actions, '... -> na ...', na = self.num_action_types)
+
+        masked_repeated_actions = einx.where('na b, na b d,', mask, repeated_actions, 0.)
+
+        # calculate new mean
+
+        numerator = reduce(masked_repeated_actions, 'na b d -> na d', 'sum')
+
+        new_mean = einx.divide('na d, na -> na d', numerator, count.clamp(min = 1e-5))
+
+        # delta
+
+        delta = new_mean - old_mean
+
+        # next mean
+
+        ratio = count / next_count.clamp(min = 1e-5)
+
+        next_mean = old_mean + einx.multiply('b ..., b', delta, ratio)
+
+        # new sum square
+
+        diff_squared = einx.subtract('na b d, na d', masked_repeated_actions,  new_mean).pow(2)
+
+        masked_diff_squared = einx.where('na b, na b d,', mask, diff_squared, 0.)
+
+        new_sum_diff_squared = reduce(masked_diff_squared, 'na b d -> na d', 'sum')
+
+        ratio = (count * old_count) / (next_count)
+
+        next_sum_diff_squared = old_sum_diff_squared + new_sum_diff_squared + einx.multiply('b, b ...', ratio, delta.pow(2))
+
+        # update
+
+        update_mask = count > 0
+
+        self.action_counts.copy_(next_count)
+        self.action_sum_diff_squared.copy_(einx.where('b, b ...,', update_mask, next_sum_diff_squared, 0.))
+        self.action_mean.copy_(einx.where('b, b ...,', update_mask, next_mean, 0.))
+
+    def normalize(
+        self,
+        actions,
+        action_types
+    ):
+        counts = self.action_counts[action_types]
+        means = self.action_mean[action_types]
+        variances = self.action_variance[action_types]
+
+        inv_std = variances.clamp(min = 1e-5).rsqrt()
+
+        inv_std = einx.where('b,, b d', counts == 0, 1., inv_std)
+
+        mean_centered = einx.subtract('b t d, b d', actions, means)
+        normed = einx.multiply('b t d, b d', mean_centered, inv_std)
+        return normed
+
+    def inverse_normalize(
+        self,
+        normed_actions,
+        action_types
+    ):
+        counts = self.action_counts[action_types]
+        means = self.action_mean[action_types]
+        variances = self.action_variance[action_types]
+
+        std = variances.clamp(min = 1e-5).sqrt()
+        std = einx.where('b,, b d', counts == 0, 1., std)
+
+        normed_actions = einx.multiply('b t d, b d', normed_actions, std)
+        actions = einx.add('b t d, b d', normed_actions, means)
+        return actions
+
+    def get_action_statistic(
+        self,
+        actions_dataset: Dataset,
+        batch_size = 16
+    ):
+        dl = DataLoader(actions_dataset, batch_size = batch_size)
+
+        for actions, action_types in dl:
+
+            actions = actions.to(self.device)
+            action_types = action_types.to(self.device)
+
+            self.update_action_statistics_with_parallel_welford_(actions, action_types)
+
+    def forward(
+        self,
+        actions,                # (b t d)
+        action_types = None,    # (b)
+        actions_are_normalized = False,
+        return_denormalized_actions = True
+    ):
+
+        assert (self.action_counts > 0).any(), 'you need to have run through the entire dataset for the action statistics before being able to train a classifier'
+
+        is_training = exists(action_types)
+        is_inferencing = not is_training
+
+        # when training, normalize the actions
+
+        if is_training and not actions_are_normalized:
+            actions = self.normalize(actions, action_types)
+
+        # to tokens, attention, then to logits
+
+        tokens = self.to_tokens(actions)
+
+        attended = self.transformer(tokens)
+
+        logits = self.to_logits(attended)
+
+        # if not training, return predicted action class
+
+        if not is_inferencing:
+            return F.cross_entropy(logits, action_types)
+
+        pred_action_types = logits.argmax(dim = -1)
+
+        unnormed_actions = self.inverse_normalize(actions, pred_action_types)
+
+        if not return_denormalized_actions:
+            return pred_action_types
+
+        return pred_action_types, unnormed_actions
 
 # random sinusoidal for times - used by deepmind a lot
 
@@ -156,6 +435,8 @@ class LBM(Module):
         self,
         action_dim,
         dim_pose,
+        action_chunk_size = None,
+        action_chunk_normalizer: ActionClassifier | None = None,
         dim = 768,
         depth = 8, # Table 2. - not very deep at all
         dim_head = 64,
@@ -277,6 +558,14 @@ class LBM(Module):
             channel_first = False
         )
 
+        # optional action normalizer - needs to be pretrained if passed in
+
+        assert not (exists(action_chunk_normalizer) and exists(action_mean_std_for_norm))
+
+        self.action_chunk_size = action_chunk_size
+        self.action_chunk_normalizer = action_chunk_normalizer
+        self.normalize_with_action_classifier = exists(action_chunk_normalizer)
+
         # tactile
 
         if exists(dim_tactile_input):
@@ -307,6 +596,15 @@ class LBM(Module):
             assert action_mean_std_for_norm.shape == (action_dim, 2)
             self.register_buffer('action_mean_std_for_norm', action_mean_std_for_norm)
 
+        # device
+
+        self.register_buffer('dummy', tensor(0), persistent = False)
+
+    @property
+    def device(self):
+        return self.dummy.device
+
+    @inputs_to_module_device
     def get_clip_text_image_feats(
         self,
         text: list[str] | Tensor,
@@ -329,6 +627,7 @@ class LBM(Module):
 
         if not is_tensor(text):
             text = self.language_tokenizer(text)
+            text = text.to(self.device)
 
         # forward through clip vit for text encoding
 
@@ -371,6 +670,7 @@ class LBM(Module):
 
         return text_embeds, image_embeds, text_encodings, text_mask
 
+    @inputs_to_module_device
     def sample(
         self,
         text: list[str] | Tensor,
@@ -414,6 +714,22 @@ class LBM(Module):
 
         sampled_actions, noise =  self.gaussian_diffusion_1d.sample(batch_size = batch_size, return_noise = True, model_forward_kwargs = model_forward_kwargs)
 
+        if self.normalize_with_action_classifier:
+            action_len = sampled_actions.shape[1]
+            needs_chunking = exists(self.action_chunk_size) and action_len > self.action_chunk_size
+
+            if needs_chunking:
+                assert divisible_by(action_len, self.action_chunk_size)
+
+                sampled_actions = rearrange(sampled_actions, 'b (c t) ... -> b c t ...')
+                sampled_actions, packed_shape = pack([sampled_actions], '* t d')
+
+            pred_action_types, sampled_actions = self.action_chunk_normalizer(sampled_actions)
+
+            if needs_chunking:
+                sampled_actions, = unpack([sampled_actions], packed_shape, '* t d')
+                sampled_actions = rearrange(sampled_actions, 'b c t ... -> b (c t) ...')
+
         if self.add_task_status_prediction and remove_task_status:
             # remove task status during inference
             # todo - should consider also fixing it at 0 and infill
@@ -430,6 +746,7 @@ class LBM(Module):
 
         return sampled_actions, noise
 
+    @inputs_to_module_device
     def forward(
         self,
         text: list[str] | Tensor,
@@ -438,6 +755,7 @@ class LBM(Module):
         touch: Tensor | None = None,
         depth_embed: Tensor | None = None,
         actions: Tensor | None = None,
+        action_types: Tensor | None = None, # Int[b]
         context: Tensor | None = None,      # Float[b n d]
         context_mask: Tensor | None = None, # Bool[b n]
         task_status: Tensor | None = None,  # must be Int['b'] of {-1, 0, 1} - `-1` for invalid action / language pair
@@ -499,6 +817,36 @@ class LBM(Module):
             depth_tokens = self.to_depth_tokens(depth_embed)
 
             model_forward_kwargs.update(prepend_embeds = depth_tokens)
+
+        # normalize action chunks if needed
+
+        assert xnor(self.normalize_with_action_classifier, exists(action_types))
+
+        if self.normalize_with_action_classifier:
+
+            action_len = actions.shape[1]
+            needs_chunking = exists(self.action_chunk_size) and action_len > self.action_chunk_size
+
+            # if action being trained on is multiple chunks
+
+            if needs_chunking:
+                assert divisible_by(action_len, self.action_chunk_size)
+
+                if action_types.ndim == 1:
+                    action_types = rearrange(action_types, 'b -> b 1')
+
+                actions = rearrange(actions, 'b (c t) d -> b c t d', t = self.action_chunk_size)
+                action_types = repeat(action_types, 'b c -> b (c r)', r = action_len // self.action_chunk_size)
+
+                actions, action_types = tuple(rearrange(t, 'b c ... -> (b c) ...') for t in (actions, action_types))
+
+            # normalize actions
+
+            actions = self.action_chunk_normalizer.normalize(actions, action_types)
+
+            if needs_chunking:
+                actions, = unpack(actions, '* t d')
+                actions = rearrange(actions, 'b ... d -> b (...) d')
 
         # diffusion loss
 
